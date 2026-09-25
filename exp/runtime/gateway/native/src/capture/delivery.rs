@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::collector::Admission;
 use super::record::Record;
 use super::response::WireResponse;
 
@@ -32,6 +33,11 @@ pub(crate) trait Sink: Send + 'static {
     /// Stop gathering after this many prepared bytes. One final record may cross it.
     fn batch_bytes(&self) -> usize {
         0
+    }
+
+    /// Bound the oldest item's wait for a useful group without delaying serving.
+    fn batch_delay(&self) -> Duration {
+        Duration::ZERO
     }
 
     fn prepared_bytes(&self, _prepared: &Self::Prepared) -> usize {
@@ -68,7 +74,7 @@ pub(crate) struct Limits {
 impl Limits {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if !(1..=4096).contains(&self.maximum_records)
-            || !(1..=8 * 1024 * 1024).contains(&self.maximum_record_bytes)
+            || !(1..=16 * 1024 * 1024).contains(&self.maximum_record_bytes)
             || self.maximum_bytes < self.maximum_record_bytes
             || self.maximum_bytes > 256 * 1024 * 1024
         {
@@ -97,6 +103,8 @@ struct Pending {
     bytes: usize,
     counters: Arc<Counters>,
     completed: Option<mpsc::SyncSender<bool>>,
+    // Keep collector admission charged until the destination acknowledges.
+    _admission: Option<Admission>,
 }
 
 struct Prepared<P> {
@@ -104,7 +112,7 @@ struct Prepared<P> {
     value: Option<P>,
 }
 
-/// Gather only already queued work, never delay an idle destination to fill a batch.
+/// Gather until a count, byte or oldest-item deadline is reached.
 /// Failed members keep their slot while acknowledged neighbors release theirs.
 fn run_worker<S: Sink>(
     receiver: mpsc::Receiver<Pending>,
@@ -133,13 +141,14 @@ fn run_worker<S: Sink>(
         counters
             .preparation_bytes
             .store(preparation_bytes, Ordering::Release);
+        let batch_deadline = Instant::now() + sink.batch_delay();
         let mut bytes = pending
             .iter()
             .filter_map(|p| p.value.as_ref())
             .map(|value| sink.prepared_bytes(value))
             .sum::<usize>();
         let mut index = 0;
-        loop {
+        'prepare_batch: loop {
             while index < pending.len() {
                 let entry = &mut pending[index];
                 if entry.value.is_none() && (bytes == 0 || bytes < sink.batch_bytes()) {
@@ -148,7 +157,8 @@ fn run_worker<S: Sink>(
                         .value
                         .as_mut()
                         .expect("unprepared record retained");
-                    if let Some(wire) = entry.item.wire.take() {
+                    if let Some(mut wire) = entry.item.wire.take() {
+                        record.transport = wire.relay.take().map(super::relay::Relay::decode);
                         record.response = wire.decode();
                         if record.response.is_none() {
                             record.provider_reasoning = None;
@@ -164,6 +174,10 @@ fn run_worker<S: Sink>(
                         entry.item.value = None;
                     } else {
                         counters.failed.fetch_add(1, Ordering::Relaxed);
+                        // A failed preparation still owns the one decoded
+                        // workspace. Leave later records compact and charged
+                        // until it recovers; prepared neighbors can still commit.
+                        break 'prepare_batch;
                     }
                 }
                 index += 1;
@@ -171,7 +185,7 @@ fn run_worker<S: Sink>(
             if pending.len() >= sink.batch_records() || bytes >= sink.batch_bytes() {
                 break;
             }
-            match receiver.try_recv() {
+            match receiver.recv_timeout(batch_deadline.saturating_duration_since(Instant::now())) {
                 Ok(item) => pending.push(Prepared { item, value: None }),
                 Err(_) => break,
             }
@@ -276,19 +290,35 @@ impl Delivery {
     /// Wait for capacity; accepted records are never discarded to make room.
     #[cfg(test)]
     pub(crate) fn submit(&self, value: Record) -> bool {
-        self.enqueue(value, None, None)
+        self.enqueue(value, None, None, None)
     }
 
-    /// A successful completion means the destination has persisted this update.
-    pub(super) fn submit_wait(&self, value: Record, wire: Option<WireResponse>) -> bool {
+    /// Transfer ownership to the background writer, not to the database caller.
+    pub(super) fn submit_record(
+        &self,
+        value: Record,
+        wire: Option<WireResponse>,
+        admission: Option<Admission>,
+    ) -> bool {
+        self.enqueue(value, wire, admission, None)
+    }
+
+    /// Preserve the default collector contract: success means the sink acknowledged.
+    pub(super) fn submit_wait(
+        &self,
+        value: Record,
+        wire: Option<WireResponse>,
+        admission: Option<Admission>,
+    ) -> bool {
         let (completed, outcome) = mpsc::sync_channel(1);
-        self.enqueue(value, wire, Some(completed)) && outcome.recv().unwrap_or(false)
+        self.enqueue(value, wire, admission, Some(completed)) && outcome.recv().unwrap_or(false)
     }
 
     fn enqueue(
         &self,
         value: Record,
         wire: Option<WireResponse>,
+        admission: Option<Admission>,
         completed: Option<mpsc::SyncSender<bool>>,
     ) -> bool {
         let bytes = value.heap_bytes() + wire.as_ref().map_or(0, WireResponse::heap_bytes);
@@ -328,6 +358,7 @@ impl Delivery {
             bytes,
             counters: self.counters.clone(),
             completed,
+            _admission: admission,
         };
         if sender.send(item).is_err() {
             return self.dropped();

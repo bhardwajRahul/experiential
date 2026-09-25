@@ -134,6 +134,88 @@ fn preparation_failure_retains_input_for_retry_without_a_false_ack() {
 }
 
 #[test]
+fn failed_preparation_owns_the_single_workspace_until_recovery() {
+    struct Preparing {
+        recover: Arc<std::sync::atomic::AtomicBool>,
+        first: std::sync::atomic::AtomicBool,
+        resume: Mutex<mpsc::Receiver<()>>,
+        attempted: mpsc::Sender<String>,
+        persisted: mpsc::Sender<String>,
+    }
+    impl Sink for Preparing {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn batch_records(&self) -> usize {
+            2
+        }
+        fn batch_bytes(&self) -> usize {
+            1024
+        }
+        fn prepared_bytes(&self, value: &String) -> usize {
+            value.len()
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            let id = &record.request.request_id;
+            self.attempted.send(id.clone()).unwrap();
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }
+            if id == "failed" && !self.recover.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                Ok(id.clone())
+            }
+        }
+        fn write(&mut self, value: &String) -> Result<(), ()> {
+            self.persisted.send(value.clone()).map_err(|_| ())
+        }
+    }
+    let recover = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (resume, paused) = mpsc::channel();
+    let (attempted, observed) = mpsc::channel();
+    let (persisted, saved) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        Preparing {
+            recover: recover.clone(),
+            first: std::sync::atomic::AtomicBool::new(true),
+            resume: Mutex::new(paused),
+            attempted,
+            persisted,
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record("failed")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "failed"
+    );
+    assert!(delivery.submit(record("waiting")));
+    resume.send(()).unwrap();
+    let until = Instant::now() + Duration::from_millis(80);
+    let mut attempts = Vec::new();
+    while let Ok(id) = observed.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        attempts.push(id);
+    }
+    recover.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(2)));
+    assert!(!attempts.is_empty());
+    assert!(attempts.iter().all(|id| id == "failed"), "{attempts:?}");
+    let mut saved: Vec<_> = saved.try_iter().collect();
+    saved.sort();
+    assert_eq!(saved, ["failed", "waiting"]);
+    assert_eq!(delivery.counts()[0], 0);
+    assert_eq!(delivery.counts()[2], 2);
+    assert_eq!(delivery.counts()[4], 0);
+}
+
+#[test]
 fn saturated_destination_waits_without_losing_records_or_exceeding_queued_budget() {
     let (delivery, entered, resume) = paused(limits(), false);
     let delivery = Arc::new(delivery);
@@ -289,7 +371,7 @@ fn shutdown_timeout_reports_incomplete_drain_without_purging_accepted_records() 
 }
 
 #[test]
-fn synchronous_completion_waits_for_acknowledgement_including_retries() {
+fn queued_completion_does_not_wait_for_storage_and_retries_keep_ownership() {
     for fail in [false, true] {
         let (delivery, entered, resume) = paused(limits(), fail);
         let delivery = Arc::new(delivery);
@@ -297,18 +379,19 @@ fn synchronous_completion_waits_for_acknowledgement_including_retries() {
         let producer = delivery.clone();
         let waiting = std::thread::spawn(move || {
             returned
-                .send(producer.submit_wait(record("ack"), None))
+                .send(producer.submit_record(record("ack"), None, None))
                 .unwrap();
         });
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert_eq!(delivery.counts()[0], 1);
+        assert!(!delivery.close_until(Instant::now()));
         resume.send(()).unwrap();
         if fail {
             assert_eq!(entered.recv_timeout(Duration::from_secs(1)).unwrap(), "ack");
-            assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
+            assert_eq!(delivery.counts()[0], 1);
             resume.send(()).unwrap();
         }
-        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
         waiting.join().unwrap();
         assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
         assert_eq!(delivery.counts()[4], 0);
@@ -339,11 +422,70 @@ fn limits_reject_zero_unbounded_and_incoherent_configuration() {
             ..limits()
         },
         Limits {
-            maximum_record_bytes: 9 * 1024 * 1024,
-            maximum_bytes: 10 * 1024 * 1024,
+            maximum_record_bytes: 17 * 1024 * 1024,
+            maximum_bytes: 18 * 1024 * 1024,
             ..limits()
         },
     ] {
         assert!(bounds.validate().is_err());
     }
+}
+
+#[test]
+fn microbatch_waits_for_neighbors_but_flushes_on_count_deadline_and_close() {
+    struct BatchSink(mpsc::Sender<Vec<String>>, mpsc::Sender<()>);
+    impl Sink for BatchSink {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            self.1.send(()).unwrap();
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            unreachable!()
+        }
+        fn batch_records(&self) -> usize {
+            2
+        }
+        fn batch_bytes(&self) -> usize {
+            1024
+        }
+        fn batch_delay(&self) -> Duration {
+            Duration::from_millis(200)
+        }
+        fn prepared_bytes(&self, value: &String) -> usize {
+            value.len()
+        }
+        fn write_batch(&mut self, values: &[&String]) -> Vec<bool> {
+            self.0
+                .send(values.iter().map(|v| (*v).clone()).collect())
+                .unwrap();
+            vec![true; values.len()]
+        }
+    }
+    let (written, observed) = mpsc::channel();
+    let (prepared, ready) = mpsc::channel();
+    let delivery = Delivery::new(limits(), BatchSink(written, prepared)).unwrap();
+    assert!(delivery.submit(record("first")));
+    ready.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(observed.recv_timeout(Duration::from_millis(20)).is_err());
+    assert!(delivery.submit(record("second")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ["first", "second"]
+    );
+    assert!(delivery.submit(record("deadline")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ["deadline"]
+    );
+    assert!(delivery.submit(record("drain")));
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ["drain"]
+    );
+    assert_eq!(delivery.counts(), [0, 0, 4, 0, 0]);
 }

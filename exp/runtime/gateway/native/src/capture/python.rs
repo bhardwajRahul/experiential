@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBytes, PyTuple};
+use serde::Deserialize;
+use serde_json::{value::RawValue, Value};
 
 use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
@@ -13,10 +15,20 @@ use super::record::{Record, Request};
 
 struct PythonSink(Py<PyAny>);
 
-const BATCH_RECORDS: usize = 64;
-const BATCH_BYTES: usize = 1024 * 1024;
+#[derive(Deserialize)]
+struct ContextSource<'a> {
+    #[serde(borrow)]
+    context: &'a RawValue,
+}
 
-struct PythonBatchSink(Py<PyAny>);
+const BATCH_RECORDS: usize = 64;
+const BATCH_BYTES: usize = 2 * 1024 * 1024;
+
+struct PythonBatchSink {
+    callback: Py<PyAny>,
+    completion_references: bool,
+    bytes_output: bool,
+}
 
 struct EncodedRecord {
     value: Py<PyAny>,
@@ -33,13 +45,20 @@ impl Sink for PythonBatchSink {
     }
 
     fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        let encoded = record.encode(maximum_bytes).ok_or(())?;
+        let encoded = if self.completion_references {
+            record.encode_update(maximum_bytes)
+        } else {
+            record.encode(maximum_bytes)
+        }
+        .ok_or(())?;
         let bytes = encoded.len();
         Python::try_attach(|py| {
-            encoded.into_pyobject(py).map(|value| EncodedRecord {
-                value: value.into_any().unbind(),
-                bytes,
-            })
+            let value = if self.bytes_output {
+                PyBytes::new(py, encoded.as_bytes()).into_any().unbind()
+            } else {
+                encoded.into_pyobject(py)?.into_any().unbind()
+            };
+            Ok::<_, PyErr>(EncodedRecord { value, bytes })
         })
         .ok_or(())?
         .map_err(|_| ())
@@ -61,6 +80,10 @@ impl Sink for PythonBatchSink {
         BATCH_BYTES
     }
 
+    fn batch_delay(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+
     fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
         prepared.bytes
     }
@@ -70,7 +93,7 @@ impl Sink for PythonBatchSink {
             // A tuple of references: payloads are never joined, parsed or encoded
             // again for batching. The callback returns per-record durable acks.
             let records = PyTuple::new(py, prepared.iter().map(|p| p.value.bind(py))).ok()?;
-            self.0
+            self.callback
                 .bind(py)
                 .call1((records,))
                 .ok()?
@@ -125,19 +148,37 @@ pub struct CaptureCollector {
 
 #[pymethods]
 impl CaptureCollector {
-    /// Deliver bounded groups of prepared JSON strings, with per-record acknowledgements.
+    /// Deliver bounded groups with per-update commit acknowledgements. Default
+    /// records remain complete schema 1. Opt-in schema-2 completion references
+    /// require a destination that retries until the prompt checkpoint is durable.
     #[staticmethod]
-    fn batched(py: Python<'_>, config_json: &str, sink: Py<PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (config_json, sink, *, completion_references=false, bytes_output=false))]
+    fn batched(
+        py: Python<'_>,
+        config_json: &str,
+        sink: Py<PyAny>,
+        completion_references: bool,
+        bytes_output: bool,
+    ) -> PyResult<Self> {
         if !sink.bind(py).is_callable() {
             return Err(PyValueError::new_err("capture batch sink must be callable"));
         }
         let config: Configuration = serde_json::from_str(config_json)
             .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
-        py.detach(|| Collector::new(config, PythonBatchSink(sink)))
-            .map(|collector| Self {
-                inner: Arc::new(collector),
-            })
-            .map_err(PyValueError::new_err)
+        py.detach(|| {
+            Collector::new(
+                config,
+                PythonBatchSink {
+                    callback: sink,
+                    completion_references,
+                    bytes_output,
+                },
+            )
+        })
+        .map(|collector| Self {
+            inner: Arc::new(collector),
+        })
+        .map_err(PyValueError::new_err)
     }
 
     /// Use the same collector and delivery worker with a native local SQLite sink.
@@ -188,14 +229,42 @@ impl CaptureCollector {
 
     /// Register effective input from authenticated admission, without writing content.
     fn begin(&self, py: Python<'_>, request_json: &str) -> bool {
+        self.begin_bytes(py, request_json.as_bytes())
+    }
+
+    /// Borrow immutable UTF-8 bytes without widening and re-encoding a Python string.
+    fn begin_bytes(&self, py: Python<'_>, request_json: &[u8]) -> bool {
         let collector = self.inner.clone();
         py.detach(|| {
-            if request_json.len() > collector.config.maximum_request_bytes {
+            if !collector.config.truncate_request
+                && request_json.len() > collector.config.maximum_request_bytes
+            {
                 return collector.skip();
             }
-            let Ok(request) = serde_json::from_str::<Request>(request_json) else {
+            let Ok(mut request) = serde_json::from_slice::<Request>(request_json) else {
                 return collector.skip();
             };
+            // The ordinary JSON projection uses finite-width numbers. Keep the
+            // original context only for exceptional numeric values, using the
+            // same lossless sidecar consumed by capture ingestion. Do not change
+            // the gateway's global number representation to repair capture.
+            if request
+                .context
+                .get("source_json")
+                .is_none_or(Value::is_null)
+                && super::response::contains_wide_number(&request.context)
+            {
+                let Ok(source) = serde_json::from_slice::<ContextSource>(request_json) else {
+                    return collector.skip();
+                };
+                let Some(context) = Arc::make_mut(&mut request.context).as_object_mut() else {
+                    return collector.skip();
+                };
+                context.insert(
+                    "source_json".into(),
+                    Value::String(source.context.get().to_owned()),
+                );
+            }
             collector.begin(request)
         })
     }
@@ -204,6 +273,31 @@ impl CaptureCollector {
     fn select_model(&self, py: Python<'_>, request_id: &str, model_id: &str) {
         let collector = self.inner.clone();
         py.detach(|| collector.select_model(request_id, model_id));
+    }
+
+    /// Claim caller-facing metadata only for an admitted original response.
+    fn claim_relay(&self, py: Python<'_>, request_id: &str) -> bool {
+        py.detach(|| self.inner.claim_relay(request_id))
+    }
+
+    /// Transfer raw wire bytes once; the delivery worker alone parses their JSON.
+    fn finish_relay(
+        &self,
+        py: Python<'_>,
+        request_id: &str,
+        metadata_json: &str,
+        body: Vec<u8>,
+    ) -> bool {
+        py.detach(|| {
+            if metadata_json.len() > 65536 || body.len() > 4 * 1024 * 1024 {
+                return false;
+            }
+            let Ok(metadata) = serde_json::from_str(metadata_json) else {
+                return false;
+            };
+            self.inner
+                .finish_relay(request_id, super::relay::Relay { metadata, body })
+        })
     }
 
     /// Apply the host's final content eligibility, independently of inference accounting.
