@@ -13,6 +13,38 @@ use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
 use super::record::{Record, Request};
 
+/// Python view of the same response evidence used by the gateway's local sink.
+#[pyclass(frozen, module = "exp_gateway_native")]
+pub struct CaptureResponse {
+    #[pyo3(get)]
+    body_json: String,
+    #[pyo3(get)]
+    completed: bool,
+    #[pyo3(get)]
+    events_json: Option<String>,
+}
+
+#[pymethods]
+impl CaptureResponse {
+    #[new]
+    fn new(py: Python<'_>, protocol: &str, body: &[u8], sse: bool) -> PyResult<Self> {
+        use super::{projection::CapturedResponse, record::Protocol};
+        let protocol = match protocol {
+            "responses" => Protocol::Responses,
+            "chat" => Protocol::ChatCompletions,
+            "messages" => Protocol::Messages,
+            _ => return Err(PyValueError::new_err("unknown capture protocol")),
+        };
+        let (body_json, completed, events_json) =
+            py.detach(|| CapturedResponse::decode(protocol, body, sse));
+        Ok(Self {
+            body_json,
+            completed,
+            events_json,
+        })
+    }
+}
+
 struct PythonSink(Py<PyAny>);
 
 #[derive(Deserialize)]

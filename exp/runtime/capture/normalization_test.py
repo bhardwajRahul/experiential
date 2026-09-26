@@ -31,7 +31,7 @@ def _exchange(**changes: str | bytes | int | bool) -> CapturedExchange:
 
 def _attributes(exchange: CapturedExchange) -> JsonObject:
     """Normalize a synthetic exchange through the canonical OTLP contract."""
-    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])
     result = normalize_otlp_payload(
         payload, source=SourceIdentity(kind="otlp", source_id="synthetic-capture")
     )
@@ -51,7 +51,7 @@ def test_known_usage_and_redacted_copies_normalize_through_existing_cloud_contra
             "metadata": {"Cookie": "private-cookie", "token": "sk-proj-abcdefghijklmnop"},
         }
     ).encode()
-    payload = normalize_exchange(_exchange(request=request), max_body_bytes=4096)
+    payload = normalize_exchange(_exchange(request=request), max_body_bytes=4096)[0]
     assert b"TOP-SECRET" not in payload
     assert b"private-cookie" not in payload
     assert b"sk-proj-" not in payload
@@ -72,6 +72,11 @@ def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
         "password": canary,
         "nested": [{"api_key": canary}],
         "query": "retain useful tool content",
+        "events": [
+            "login",
+            "logout",
+            {"arguments": '{"city":"SF"}', "partial_json": "literal value"},
+        ],
     }
     if array_arguments:
         arguments = [arguments]
@@ -129,7 +134,7 @@ def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
         response=body,
         response_content_type="text/event-stream" if streamed else "application/json",
     )
-    payload = normalize_exchange(exchange, max_body_bytes=4096)
+    payload = normalize_exchange(exchange, max_body_bytes=4096)[0]
     assert canary.encode() not in payload
     attributes = _attributes(exchange)
     for key in ("gen_ai.input.messages", "gen_ai.output.messages"):
@@ -148,6 +153,11 @@ def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
             "password": "[REDACTED]",
             "nested": [{"api_key": "[REDACTED]"}],
             "query": "retain useful tool content",
+            "events": [
+                "login",
+                "logout",
+                {"arguments": '{"city":"SF"}', "partial_json": "literal value"},
+            ],
         }
 
 
@@ -172,7 +182,7 @@ def test_malformed_tool_arguments_are_redacted(arguments: str) -> None:
         "input": [{"type": "function_call", "arguments": arguments}],
     }
     exchange = _exchange(request=json.dumps(request).encode())
-    payload = normalize_exchange(exchange, max_body_bytes=4096)
+    payload = normalize_exchange(exchange, max_body_bytes=4096)[0]
     assert b"ordinary-secret" not in payload
     attributes = _attributes(exchange)
     captured = json.loads(str(attributes["exp.capture.request"]))
@@ -198,7 +208,9 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
                     {
                         "index": 0,
                         "delta": {
-                            "content": "retain ordinary output" if index == 0 else "",
+                            "content": "retain ordinary output Bearer "
+                            if index == 0
+                            else "SYNTHETIC_SPLIT_SECRET",
                             "tool_calls": [{"index": 0, "function": {"arguments": fragment}}],
                         },
                     }
@@ -211,7 +223,12 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
             {
                 "type": "content_block_start",
                 "index": 0,
-                "content_block": {"type": "text", "text": "retain ordinary output"},
+                "content_block": {"type": "text", "text": "retain ordinary output Bearer "},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "SYNTHETIC_SPLIT_SECRET"},
             },
             {
                 "type": "content_block_start",
@@ -228,6 +245,7 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
                 }
             )
     body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+    body += b'data: {"password":"' + canary.encode() + b'",\n\n'
     payload = normalize_exchange(
         _exchange(
             protocol=protocol,
@@ -236,8 +254,9 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
             failed=True,
         ),
         max_body_bytes=4096,
-    )
+    )[0]
     assert canary.encode() not in payload
+    assert b"SYNTHETIC_SPLIT_SECRET" not in payload
     assert b"[REDACTED_INVALID_TOOL_ARGUMENTS]" in payload
     assert b"retain ordinary output" in payload
 
@@ -260,7 +279,7 @@ def test_deep_json_tool_arguments_are_bounded_and_redacted(nesting: int) -> None
     request = {"model": "gpt-test", "input": [{"type": "function_call", "arguments": arguments}]}
     payload = normalize_exchange(
         _exchange(request=json.dumps(request).encode()), max_body_bytes=4096
-    )
+    )[0]
     assert canary.encode() not in payload
     assert b"[REDACTED_DEEP_VALUE]" in payload
 
@@ -272,7 +291,7 @@ def test_cancelled_sse_keeps_request_and_complete_events_without_inventing_usage
         _exchange(response=body, response_content_type="text/event-stream", failed=True)
     )
     assert "gen_ai.usage.input_tokens" not in attributes
-    assert "partial" in str(attributes["exp.capture.response"])
+    assert "partial" in str(attributes["exp.capture.events"])
     assert attributes["exp.capture.interrupted"] is True
 
 
@@ -287,6 +306,7 @@ def test_terminal_response_survives_later_transport_failure(
         "status": "completed" if completed else "incomplete",
         "model": "test",
         "output": [],
+        "metadata": {"record_id": 18446744073709551617},
         "usage": {"input_tokens": 23, "output_tokens": 17},
     }
     body = json.dumps(response).encode()
@@ -303,7 +323,9 @@ def test_terminal_response_survives_later_transport_failure(
     assert attributes["exp.capture.interrupted"] is not completed
     assert attributes["gen_ai.usage.input_tokens"] == 23
     assert attributes["gen_ai.usage.output_tokens"] == 17
-    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096))["resourceSpans"][0][
+    assert json.loads(str(attributes["exp.capture.response"]))["metadata"] == response["metadata"]
+    assert "exp.capture.events" not in attributes
+    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])["resourceSpans"][0][
         "scopeSpans"
     ][0]["spans"][0]
     assert span["status"]["code"] == (1 if completed else 2)
@@ -339,7 +361,7 @@ def test_stream_completion_and_provider_errors_remain_separate_from_transport_er
     assert attributes["exp.capture.interrupted"] is not completed
     assert attributes["gen_ai.usage.input_tokens"] == 3
     assert attributes["gen_ai.usage.output_tokens"] == 7
-    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096))["resourceSpans"][0][
+    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])["resourceSpans"][0][
         "scopeSpans"
     ][0]["spans"][0]
     assert span["status"]["code"] == (2 if provider_error or not completed else 1)
@@ -379,7 +401,7 @@ def test_interrupted_compressed_sse_retains_complete_events_without_compression_
         assert attributes["gen_ai.usage.input_tokens"] == 3
         assert attributes["gen_ai.usage.output_tokens"] == 7
     else:
-        assert "retained text" in str(attributes["exp.capture.response"])
+        assert "retained text" in str(attributes["exp.capture.events"])
         assert "gen_ai.usage.input_tokens" not in attributes
 
 
@@ -445,7 +467,12 @@ def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
             "index": 0,
             "content_block": {"type": "tool_use", "name": "f", "id": "t", "input": {}},
         },
-        {"type": "content_block_delta", "index": 0, "delta": {"partial_json": '{"x":1}'}},
+        {"type": "content_block_stop", "index": 99},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"partial_json": '{"x":18446744073709551617,"password":"TOOL_SECRET"}'},
+        },
         {"type": "message_delta", "usage": {"output_tokens": 4}},
     ]
     body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
@@ -460,7 +487,12 @@ def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
     raw_response = attributes["exp.capture.response"]
     assert isinstance(raw_response, str)
     response = json.loads(raw_response)
-    assert response["content"][0]["input"] == {"x": 1}
+    assert response["content"][0]["input"] == {
+        "x": 18446744073709551617,
+        "password": "[REDACTED]",
+    }
+    assert "TOOL_SECRET" not in str(attributes)
+    assert "capture_input_source_json" not in str(attributes)
     assert attributes["gen_ai.usage.input_tokens"] == 9
     assert attributes["gen_ai.usage.output_tokens"] == 4
 
@@ -590,7 +622,9 @@ def test_compressed_copies_are_bounded(encoding: str) -> None:
         else zstandard.ZstdCompressor().compress(expanded)
     )
     with pytest.raises(ValueError, match="limit"):
-        normalize_exchange(_exchange(request=bomb, request_encoding=encoding), max_body_bytes=4096)
+        normalize_exchange(_exchange(request=bomb, request_encoding=encoding), max_body_bytes=4096)[
+            0
+        ]
 
 
 def test_paths_exclude_login_billing_and_unrelated_traffic() -> None:
@@ -632,6 +666,7 @@ def test_chat_stream_reassembles_tool_arguments_and_final_usage() -> None:
             "usage": {"prompt_tokens": 2, "completion_tokens": 3},
         },
     ]
+    events.append({"choices": [{"delta": {"content": "unindexed"}}]})
     body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
     attributes = _attributes(
         _exchange(
@@ -663,7 +698,7 @@ def test_provider_stream_errors_are_failed_spans_even_with_http_200() -> None:
                 response_content_type="text/event-stream",
             ),
             max_body_bytes=4096,
-        )
+        )[0]
     )
     span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
     assert span["status"]["code"] == 2
@@ -697,7 +732,7 @@ def test_chat_refusals_preserve_text_and_finish_reason_as_failed_spans(
     assert response["choices"][0]["message"]["refusal"] == message["refusal"]
     assert response["choices"][0]["finish_reason"] == finish_reason
     assert attributes["exp.capture.refused"] is True
-    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])
     assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2
 
 
@@ -754,5 +789,5 @@ def test_responses_and_messages_refusals_preserve_provider_evidence(
     attributes = _attributes(exchange)
     assert "Cannot." in str(attributes["gen_ai.output.messages"])
     assert attributes["exp.capture.refused"] is True
-    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])
     assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2

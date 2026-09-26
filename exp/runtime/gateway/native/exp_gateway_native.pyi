@@ -45,6 +45,17 @@ class ShutdownHandle:
 
     def request_shutdown(self) -> None: ...
 
+class CaptureResponse:
+    """Observed provider output and terminal evidence shared with gateway capture."""
+
+    def __init__(self, protocol: str, body: bytes, sse: bool) -> None: ...
+    @property
+    def body_json(self) -> str: ...
+    @property
+    def completed(self) -> bool: ...
+    @property
+    def events_json(self) -> str | None: ...
+
 class CaptureCollector:
     """Bounded native content capture with an off-path persistence destination."""
 
