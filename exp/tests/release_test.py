@@ -19,6 +19,7 @@ import zipfile
 from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import cast
+from unittest.mock import Mock
 
 from click import unstyle
 
@@ -524,7 +525,9 @@ def _run_tty_child(
         os.close(master)
     assert process.returncode == 0, transcript
     assert not pending, f"unanswered prompts {pending}:\n{transcript}"
-    assert completion_seen, f"missing completion marker {completion_marker!r}:\n{transcript}"
+    assert completion_marker is None or completion_marker in transcript, (
+        f"missing completion marker {completion_marker!r}:\n{transcript}"
+    )
     return transcript
 
 
@@ -3050,6 +3053,44 @@ def _installed_release_driver() -> None:
         server.server_close()
         server_thread.join(timeout=5)
         assert not server_thread.is_alive()
+
+
+def test_tty_child_checks_marker_after_draining_exited_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check the final transcript when a child exits before the first poll.
+
+    Args:
+        tmp_path: Isolated child working directory.
+        monkeypatch: Fixture forcing child exit before the interactive polling loop.
+    """
+    for output in ("NO MARKER", "COMPLETE"):
+        process = Mock(returncode=0)
+        process.poll.return_value = 0
+        selector = Mock()
+        selector.select.return_value = [(None, selectors.EVENT_READ)]
+        monkeypatch.setattr(subprocess, "Popen", Mock(return_value=process))
+        monkeypatch.setattr(selectors, "DefaultSelector", Mock(return_value=selector))
+        monkeypatch.setattr(os, "read", Mock(side_effect=[output.encode(), b""]))
+        command = [sys.executable, "-c", "pass"]
+        if output == "NO MARKER":
+            with pytest.raises(AssertionError, match="missing completion marker"):
+                _run_tty_child(
+                    command,
+                    cwd=tmp_path,
+                    environment=os.environ.copy(),
+                    answers=[],
+                    completion_marker="COMPLETE",
+                )
+        else:
+            transcript = _run_tty_child(
+                command,
+                cwd=tmp_path,
+                environment=os.environ.copy(),
+                answers=[],
+                completion_marker="COMPLETE",
+            )
+            assert "COMPLETE" in transcript
 
 
 def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
